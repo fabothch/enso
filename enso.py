@@ -6463,6 +6463,327 @@ class orca_job(qm_job):
         return
 
 
+
+### NEW ADF PART ###
+
+# If an ADF calculation is desired, run this script via startpyhon (included in the AMS package)
+# startpython enso.py > enso.out &
+
+# If there are problems with using the PLAMS library, add the /<path to adf program>/scripting
+# directory to the sys.path on your own, e.g. via:
+#import sys
+#sys.path.append('/software/qc/adf/adf2019.304/scripting/')
+
+# A args.prog4 == "adf" possibility must be available
+In enso, do something like that:
+if args.prog4 == "adf":
+    from scm import plams
+
+
+### new ADFNMRJob class ###
+class ADFNMRJob(plams.ADFJob):
+
+    workdir = os.getcwd()
+
+    # attributes of the ADFJob class and additional new ones
+    def __init__(self, name, molecule, settings, calcS, calcJ):
+        plams.ADFJob.__init__(self, name=name, molecule=molecule, settings=settings)
+        self.calcS = calcS
+        self.calcJ = calcJ
+        self.nat = molecule.__len__()
+
+    # choose a string for the program name ("nmr", "cpl") and a list of strings with their input
+    def get_scriptpart(self, namestr, input):
+        part = "$ADFBIN/" + namestr + " -n " + str(self.settings.runscript.nproc) + " << eor\n\n"
+        part += "\n".join(input)
+        part += "\n\neor\n" + "mv logfile logfile_" + namestr
+        return part
+
+    # redefine the prerun method of the ADFJob class
+    # this method is called upon job.run() before the actual execution
+    def prerun(self):
+        # make sure that "save TAPE10" is in the input for the ADF calculation (needed for nmr)
+        # this is actually not needed for enso as we ensure to set sets.input.save = "TAPE10"
+        inputsets = self.settings.input
+        save = inputsets.find_case("save")
+        if save in inputsets and "TAPE10" not in inputsets.save:
+            if isinstance(inputsets.save, str):
+                inputsets.save += " TAPE10"
+            elif isinstance(inputsets.save, list):
+                inputsets.save.append("TAPE10")
+        else:
+            inputsets.save = "TAPE10"
+        
+        # add the following string after the sp calculation
+        adf_input = "mv logfile logfile_scf\n\n\n"
+
+        # settings.nmr.nuclei is a list of the atomic numbers of the desired NMR nuclei
+        # settings.nmr.atoms is then a list of atom indices for which the shielding will be calculated
+        if self.calcS:
+            self.settings.nmr.atoms = []
+            # self.molecule[i] is atom of input number i with nuclear charge atnum (numbering starts with 1) (see from ADFJob class)
+            for i_atom in range(self.nat):
+                if self.molecule[i_atom + 1].atnum in self.settings.nmr.nuclei:
+                    self.settings.nmr.atoms.append(i_atom + 1)
+            if len(self.settings.nmr.atoms) == 0:
+                log("WARNING: The list of atoms in settings.nmr.atoms is empty. No NMR shielding constants will be calculated.")
+
+            atoms_str = " ".join(str(i) for i in self.settings.nmr.atoms)
+
+            # choose input options for shieldings calculation here or exchange them by variables
+            nmr_input = ["nmr", "  out iso tens", "  calc all", "  u1k best", "  atoms " + atoms_str, "end"]
+
+        # calculate couplings of all atoms with all other atoms (currently no other possible choice implemented)
+        # this requires some weird input produced here, see ADF manual -> NMR Coupling Constants
+        if self.calcJ:
+            couplings_str = ["  nuclei "]*(self.nat - 1)
+            for i in range(self.nat - 1):
+                couplings_str[i] += " ".join([str(i+1), str(i+2)])
+                if i + 2 < self.nat:
+                    couplings_str[i] += ":" + str(self.nat)
+            couplings_str = "\n".join(couplings_str)
+
+            # choose input options for couplings calculation here or exchange them by variables
+            cpl_input = ["nmrcoupling", "  fc", couplings_str, "end"]
+
+            # if the functional is of the PBE family (only then!), use the GGA keyword for cpl
+            # we have to check here if functional is GGA or hybrid, then if it is PBE or PBE0 (something like revPBE may be added here)
+            # then we have to delete the empty object created by the False isinstance to prevent additional entries in the <name>.in file
+            if isinstance(self.settings.input.xc.gga, str):
+                if self.settings.input.xc.gga.lower() == "pbe":
+                    cpl_input.insert(0, "gga\n")
+            else:
+                del self.settings.input.xc.gga
+            if isinstance(self.settings.input.xc.hybrid, str):
+                if self.settings.input.xc.hybrid.lower() == "pbe0":
+                    cpl_input.insert(0, "gga\n")
+            else:
+                del self.settings.input.xc.hybrid
+
+        # append the nmr input to the runscript
+        if self.calcS and self.calcJ:
+            self.settings.runscript.post = adf_input \
+                                         + self.get_scriptpart("cpl", cpl_input) + "\n\n\n" \
+                                         + self.get_scriptpart("nmr", nmr_input)
+        elif self.calcS and not self.calcJ:
+            self.settings.runscript.post = adf_input \
+                                         + self.get_scriptpart("nmr", nmr_input)
+        elif not self.calcS and self.calcJ:
+            self.settings.runscript.post = adf_input \
+                                         + self.get_scriptpart("cpl", cpl_input)
+        else:
+            self.settings.runscript.post = adf_input
+
+
+### adf_job class ###
+class adf_job(qm_job):
+
+    adf_func = ""                 # choose from "PBE", "PBE0", "KT2" (case insensitive) (no default)
+    adf_basis = ""                # choose from "TZP", "TZ2P", "ZORA/TZP", "ZORA/TZ2P" (no default)
+    inputname = ""                # name of the input structure file (must be in .xyz format) (no default)
+    adf_name = "adf_enso"         # choose a name for the folder the calculation is executed in (default is "adf_enso")
+    adf_nproc = 4                 # choose number of CPU cores to be used (default is 4)
+    adf_zora_scalar = False       # choose scalar-relativistic ZORA option (the correct basis set must be chosen then) (default is no)
+    adf_zora_spinorbit = False    # choose spin-orbit relativistic ZORA option (the correct basis set must be chosen then) (default is no)
+    adf_numericalquality = "good" # choose from "good", "verygood" (sets Becke grid and Zlm fit) (default is good)
+
+    # ADF needs the Jacob's ladder step of the functional, so all available ones need to be in a checklist (may be expanded)
+    # In ADF, NMR shifts can only be computed for GGA and hybrid functionals (no metaGGA, metahybrid or doublehybrids, no functionals from libxc library)
+    adf_funclist_gga = ["pbe", "kt2"]
+    adf_funclist_hybrid = ["pbe0"]
+
+    # Some essential settings are created or read in by the prepare method
+    # This method must be called to set up the job after choosing the options and before starting the actual job
+    def prepare(self):
+        # define structure
+        self.mol = plams.Molecule(self.inputname)
+        # define settings
+        self.sets = plams.Settings()
+
+        # entries in input
+        if self.adf_func.lower() in self.adf_funclist_gga:
+            self.sets.input.xc.gga = self.adf_func
+        elif self.adf_func.lower() in self.adf_funclist_hybrid:
+            self.sets.input.xc.hybrid = self.adf_func
+        else:
+            print("Error: unknown functional for ADF")
+            exit()
+        self.sets.input.basis.type = self.adf_basis
+
+        self.sets.input.basis.core = "none"   # needed for NMR calculation, not possible with frozen core approximation
+        self.sets.input.numericalquality = self.adf_numericalquality
+        # TODO: There are many more possibilities to assign a solvent model (see manual), which are important/useful here?
+        self.sets.input.solvation.solv = "name=" + self.solv
+        self.sets.input.save = "TAPE10"   # needed for NMR calculation (TAPE10 contains necessary information)
+        self.sets.input.symmetry = "nosym"   # needed for NMR calculations of single atoms or ZORA
+        self.sets.input.occupations = "IntegerAufbau"
+        if self.adf_zora_spinorbit:
+            self.sets.input.relativistic = "spinorbit ZORA"
+        elif self.adf_zora_scalar:
+            self.sets.input.relativistic = "scalar ZORA"
+
+        # entries in the runscript
+        self.sets.runscript.shebang = "#!/bin/bash"
+        self.sets.runscript.nproc = self.adf_nproc
+
+        # list of nuclei (atomic number) for which the shieldings shall be calculated
+        self.sets.nmr.nuclei = []
+        if self.hactive:
+            self.sets.nmr.nuclei.append(1)
+        if self.cactive:
+            self.sets.nmr.nuclei.append(6)
+        if self.factive:
+            self.sets.nmr.nuclei.append(9)
+        if self.siactive:
+            self.sets.nmr.nuclei.append(14)
+        if self.pactive:
+            self.sets.nmr.nuclei.append(15)
+
+        return
+    
+    """
+    Before PLAMS can be used, it has to be initialized via plams.init(path=None, folder=None), e.g.:
+    # plams.init(path=os.getcwd(), folder="adf_nmr")
+    # ...
+    # plams.finish()
+    Afterwards, we want to set the verbosity level of the PLAMS output to a minimum:
+    # plams.config.log.stdout = 0   # perhaps 1 is better than 0 in case errors occur?
+    These methods will be found in all following functions that are setting up and starting a job.
+
+    plams.config.log defines the amount of output generated by PLAMS, possible attributes:
+    file   (integer) - verbosity of logs printed to the logfile in the main working folder, default: 5
+    stdout (integer) - verbosity of logs printed to the standard output, default: 3
+    time   (boolean) - print time of each log event, default: True
+    date   (boolean) - print date of each log event, default: False
+    verbosity levels: 0: none, 1: important, 3: normal, 5: verbose, 7: debug
+    Problem: plams.init() must be called at the beginning and creates default config, where default
+             of config.log.stdout is 3 and prints the hint "using ... folder" with level 1
+    Is there a possibility to set this value to 0 before calling plams.init()? (don't want to change the default file)
+    """
+
+    # only ADF single point calculation (probably not really needed)
+    def _sp(self):
+        plams.init(path=os.getcwd(), folder="adf_sp")
+        plams.config.log.stdout = 0
+        self.sp_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=False, calcJ=False)
+        self.sp_job.run()
+        plams.finish()
+        return
+    
+    # perform ADF single point calculation followed by calculation of NMR coupling constants
+    def _nmrJ(self):
+        plams.init(path=os.getcwd(), folder="adf_nmrJ")
+        plams.config.log.stdout = 0
+        self.J_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=False, calcJ=True)
+        self.J_job.run()
+        plams.finish()
+        return
+    
+    # perform ADF single point calculation followed by calculation of NMR shielding constants
+    def _nmrS(self):
+        plams.init(path=os.getcwd(), folder="adf_nmrS")
+        plams.config.log.stdout = 0
+        self.S_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=True, calcJ=False)
+        self.S_job.run()
+        plams.finish()
+        return
+
+    # perform ADF single point calculation, then calculation of NMR coupling, then shielding constants (this order is necessary)
+    def _nmrJS(self):
+        plams.init(path=os.getcwd(), folder="adf_nmrJS")
+        plams.config.log.stdout = 0
+        self.JS_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=True, calcJ=True)
+        self.JS_job.run()
+        plams.finish()
+        return
+
+    # read shielding and coupling constants and write them to plain output
+    # this method can only be used after the job was executed via job.run() (so one of the above functions has been called before)
+    # readkf(section, variable) reads a the binary kf results file <title>.t21
+    # convert the file to ascii via dmpkf <title>.t21 > results and search for the desired section and variables
+    # functions KFFile.sections() and KFFile.read_section(section) can help searching for sections and variables
+    def _genericoutput(self, job):
+        # shielding constants part
+        if job.calcS:
+            atom = job.settings.nmr.atoms
+            sigma = []
+
+            # read the chemical shielding conastants [ppm] (section="Properties", variable="NMR Shieldings InputOrder")
+            # the shifts are then stored in the list sigma
+            sigma = job.results.readkf("Properties", "NMR Shieldings InputOrder")
+            # sigma still contains arbirary values for the atoms not in self.settings.nmr.atoms
+            # so delete them from the list to synchronize sigma with atoms
+            for i in range(len(sigma)):
+                if i+1 not in atom:
+                    del sigma[i]
+
+        # coupling constants part
+        if job.calcJ:
+            atom1 = []
+            atom2 = []
+            jab = []
+
+            # read the NMR spin-spin coupling constants [Hz] (section="Properties", variable="NMR Coupling J const InputOrder")
+            # the couplings are then stored in the list jab
+            """
+            ADF uses a weird ordering here: res_tmp is a list of nat*nat coupling constants in blocks of nat.
+            The first block is coupling of atom 1 with 1 to nat the second 2 with 1 to nat and so on using the input numbering of atoms.
+            Coupling i with j = j with i, but only one of them contains the value, the other one is 0.0 (for efficiency).
+            The place in res_tmp with the value is determined by ADF's internal numbering of atoms, so it is impossible to find the correct entry.
+            This is why here, the entry is only saved (appended to jab) if it is not 0.0.
+            Does this cause potential problems? Is there a better way to do this? (works for ethanol molecule)
+            """
+            res_tmp = job.results.readkf("Properties", "NMR Coupling J const InputOrder")
+            for i in range(job.nat):
+                for j in range(job.nat):
+                    index = job.nat * i + j
+                    if res_tmp[index] != 0.0:
+                        atom1.append(i + 1)
+                        atom2.append(j + 1)
+                        jab.append(res_tmp[index])
+
+        # write everything to nmrprop.dat file
+        with open(os.path.join(job.workdir, "nmrprop.dat"), "w", newline=None) as out:
+            if job.calcS:
+                s = sorted(zip(atom, sigma))       # Are these two lines
+                atom, sigma = map(list, zip(*s))   # still necessary?
+                for i in range(len(atom)):
+                    out.write("{:{digits}} {}\n".format(atom[i], sigma[i], digits=4))
+                for i in range(job.nat - len(atom)):
+                    out.write("\n")
+            if job.calcJ:
+                for i in range(len(atom1)):
+                    out.write("{:{digits}} {:{digits}}   {}\n".format(atom1[i], atom2[i], jab[i], digits=4))
+
+        return
+
+"""
+This is an example for an ethanol molecule that shall be calculated with ADF:
+
+# create an adf_job and choose some settings
+job = adf_job()
+job.inputname = "ethanol.xyz"
+job.adf_func = "KT2"
+job.adf_basis = "TZ2P"
+job.chrg = 0
+job.hactive = True
+job.cactive = True
+job.solv = "chloroform"
+
+# set up the job (prepare), calculate coupling and shielding constants and generate the output in the nmrprop.dat file
+job.prepare()
+#job._sp()
+#job._nmrS()
+#job._nmrJ()
+job._nmrJS()
+job._genericoutput(job.JS_job)
+
+"""
+
+### END OF NEW ADF PART ###
+
+
+
 def execute_data(q, resultq):
     """code that the worker has to execute """
     while True:
