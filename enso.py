@@ -6475,15 +6475,12 @@ class orca_job(qm_job):
 #sys.path.append('/software/qc/adf/adf2019.304/scripting/')
 
 # A args.prog4 == "adf" possibility must be available
-In enso, do something like that:
 if args.prog4 == "adf":
     from scm import plams
 
 
 ### new ADFNMRJob class ###
 class ADFNMRJob(plams.ADFJob):
-
-    workdir = os.getcwd()
 
     # attributes of the ADFJob class and additional new ones
     def __init__(self, name, molecule, settings, calcS, calcJ):
@@ -6575,8 +6572,10 @@ class ADFNMRJob(plams.ADFJob):
             self.settings.runscript.post = adf_input
 
 
-### adf_job class ###
+### adf_job class analogous to tm_job and orca_job ###
 class adf_job(qm_job):
+
+    workdir = os.getcwd()         # working directory for the ADF calculation (default is current working directory)
 
     adf_func = ""                 # choose from "PBE", "PBE0", "KT2" (case insensitive) (no default)
     adf_basis = ""                # choose from "TZP", "TZ2P", "ZORA/TZP", "ZORA/TZ2P" (no default)
@@ -6663,7 +6662,7 @@ class adf_job(qm_job):
 
     # only ADF single point calculation (probably not really needed)
     def _sp(self):
-        plams.init(path=os.getcwd(), folder="adf_sp")
+        plams.init(path=self.workdir, folder="adf_sp")
         plams.config.log.stdout = 0
         self.sp_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=False, calcJ=False)
         self.sp_job.run()
@@ -6672,7 +6671,7 @@ class adf_job(qm_job):
     
     # perform ADF single point calculation followed by calculation of NMR coupling constants
     def _nmrJ(self):
-        plams.init(path=os.getcwd(), folder="adf_nmrJ")
+        plams.init(path=self.workdir, folder="adf_nmrJ")
         plams.config.log.stdout = 0
         self.J_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=False, calcJ=True)
         self.J_job.run()
@@ -6681,7 +6680,7 @@ class adf_job(qm_job):
     
     # perform ADF single point calculation followed by calculation of NMR shielding constants
     def _nmrS(self):
-        plams.init(path=os.getcwd(), folder="adf_nmrS")
+        plams.init(path=self.workdir, folder="adf_nmrS")
         plams.config.log.stdout = 0
         self.S_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=True, calcJ=False)
         self.S_job.run()
@@ -6690,19 +6689,40 @@ class adf_job(qm_job):
 
     # perform ADF single point calculation, then calculation of NMR coupling, then shielding constants (this order is necessary)
     def _nmrJS(self):
-        plams.init(path=os.getcwd(), folder="adf_nmrJS")
+        plams.init(path=self.workdir, folder="adf_nmrJS")
         plams.config.log.stdout = 0
         self.JS_job = ADFNMRJob(name=self.adf_name, molecule=self.mol, settings=self.sets, calcS=True, calcJ=True)
         self.JS_job.run()
         plams.finish()
         return
 
-    # read shielding and coupling constants and write them to plain output
+    # read shielding and coupling constants and write them to a nmrprop.dat file
     # this method can only be used after the job was executed via job.run() (so one of the above functions has been called before)
+    # the job is loaded and needs the information about the calculation that has been chosen (options: "sp", "nmrJ", "nmrS", "nmrJS")
     # readkf(section, variable) reads a the binary kf results file <title>.t21
     # convert the file to ascii via dmpkf <title>.t21 > results and search for the desired section and variables
     # functions KFFile.sections() and KFFile.read_section(section) can help searching for sections and variables
-    def _genericoutput(self, job):
+    def _genericoutput(self, calctype):
+        # make sure no non-existing option was chosen
+        if calctype not in ["sp", "nmrJ", "nmrS", "nmrJS"]:
+            print("ERROR: ADF's _genericoutput calculation option {} does not exist. No nmrprop.dat file created.".format(calctype))
+            return
+
+        # get the path to the .dill file of the job that has been carried out before
+        dillpath = os.path.join(self.workdir, "adf_" + calctype, self.adf_name, self.adf_name + ".dill")
+
+        # make sure the .dill file exists (if not, no job has been run)
+        if not os.path.exists(dillpath):
+            print("ERROR: ADF calculation in {} required by _genericoutput does not exist yet. No nmrprop.dat file created".format(dillpath))
+            return
+
+        # load the job from the respective .dill file
+        # unfortunately, this only works in the plams.init() ... plams.finish() environment in an extra folder ("tmpdir...")
+        # the temporary folder is deleted at the end after plams.finish()
+        plams.init(self.workdir, folder="tmpdir_adf_genericoutput")
+        plams.config.log.stdout = 0
+        job = plams.load(dillpath)
+
         # shielding constants part
         if job.calcS:
             atom = job.settings.nmr.atoms
@@ -6742,8 +6762,8 @@ class adf_job(qm_job):
                         atom2.append(j + 1)
                         jab.append(res_tmp[index])
 
-        # write everything to nmrprop.dat file
-        with open(os.path.join(job.workdir, "nmrprop.dat"), "w", newline=None) as out:
+        # write everything to the nmrprop.dat file
+        with open(os.path.join(self.workdir, "nmrprop.dat"), "w", newline=None) as out:
             if job.calcS:
                 s = sorted(zip(atom, sigma))       # Are these two lines
                 atom, sigma = map(list, zip(*s))   # still necessary?
@@ -6754,15 +6774,21 @@ class adf_job(qm_job):
             if job.calcJ:
                 for i in range(len(atom1)):
                     out.write("{:{digits}} {:{digits}}   {}\n".format(atom1[i], atom2[i], jab[i], digits=4))
+        
+        # close the plams environment and delete the temporary working folder
+        plams.finish()
+        shutil.rmtree(os.path.join(self.workdir, "tmpdir_adf_genericoutput"))
 
         return
+
 
 """
 This is an example for an ethanol molecule that shall be calculated with ADF:
 
 # create an adf_job and choose some settings
 job = adf_job()
-job.inputname = "ethanol.xyz"
+# change job.workdir if it should not be the current working directory (default is os.getcwd())
+job.inputname = "ethanol.xyz"   # molecular structure can also be read in differnetly, e.g. as a loop over atoms
 job.adf_func = "KT2"
 job.adf_basis = "TZ2P"
 job.chrg = 0
@@ -6776,7 +6802,7 @@ job.prepare()
 #job._nmrS()
 #job._nmrJ()
 job._nmrJS()
-job._genericoutput(job.JS_job)
+job._genericoutput("nmrJS")
 
 """
 
